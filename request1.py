@@ -126,7 +126,7 @@ class AsyncChatGLMClient:
 # 2. model参数可选：glm-4, glm-4-plus, glm-4-flash等
 # 3. 如需代理，取消注释proxy参数
 async_client = AsyncChatGLMClient(
-    api_key="a267b49e9e1541a3b7a4a3d8575e3fe1.EBwg6bRezSwljXHz",  # ⚠️ 请替换为你的ChatGLM API密钥
+    api_key="YOUR_API_KEY",  # ⚠️ 请替换为你的ChatGLM API密钥
     base_url="https://open.bigmodel.cn/api/paas/v4",
     max_concurrent=5,
     # proxy="http://127.0.0.1:7897"  # 如需代理，取消注释
