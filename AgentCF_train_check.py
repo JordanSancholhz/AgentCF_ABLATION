@@ -1,0 +1,890 @@
+import math
+
+from memory_manager import parse_attribute_rationale, evaluate_memory_gate, save_stm_and_history, \
+    generate_ltm_from_history, load_stm_attributes
+from prompt import *
+import random
+import re
+from fuzzywuzzy import fuzz
+import shutil
+import os
+from dataPrepare import createInterDF, createItemDF, createRandomDF
+from request1 import async_client
+import json
+import asyncio
+import threading
+from tqdm import tqdm
+import time
+from copy import deepcopy
+
+# ✅ 从config导入所有配置，零硬编码
+from config import (
+    model, train_file, random_file, item_file,
+    exp_name, initial_memory_dir, update_negative_samples,
+    random_seed, save_negative_samples,
+    async_training_batch_size, async_training_max_concurrent,
+    USE_FIXED_NEGATIVES, TRAIN_NEGATIVES_FILE,
+    MEMORY_BASE_DIR, LOG_DIR,
+    ENABLE_ATTRIBUTE_GUIDANCE, ENABLE_MEMORY_GATING, ENABLE_SEPARATE_LTM  # 新增
+)
+
+mode = "train"
+
+# ============= 断点续训辅助函数 =============
+def save_checkpoint(batch_idx, total_batches):
+    """保存检查点"""
+    from config import CHECKPOINT_FILE
+    checkpoint = {"batch": batch_idx, "total": total_batches}
+    os.makedirs(os.path.dirname(CHECKPOINT_FILE), exist_ok=True)
+    with open(CHECKPOINT_FILE, 'w', encoding='utf-8') as f:
+        json.dump(checkpoint, f)
+    print(f"💾 检查点已保存: {batch_idx + 1}/{total_batches} ({(batch_idx + 1) / total_batches * 100:.1f}%)")
+
+
+def load_checkpoint():
+    """加载检查点"""
+    from config import CHECKPOINT_FILE
+    if os.path.exists(CHECKPOINT_FILE):
+        with open(CHECKPOINT_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            return data
+    return None
+
+
+def clear_checkpoint():
+    """清除检查点"""
+    from config import CHECKPOINT_FILE
+    if os.path.exists(CHECKPOINT_FILE):
+        os.remove(CHECKPOINT_FILE)
+        print("🗑️  检查点已清除")
+
+
+# ============= 新增：加载固定负样本 =============
+def load_fixed_train_negatives():
+    """加载预生成的固定训练负样本"""
+    if not USE_FIXED_NEGATIVES:
+        return None
+
+    if not os.path.exists(TRAIN_NEGATIVES_FILE):
+        print(f"❌ 固定负样本文件不存在: {TRAIN_NEGATIVES_FILE}")
+        print(f"请先运行: python negative_sampler.py --seed {random_seed} --verify")
+        exit(1)
+
+    with open(TRAIN_NEGATIVES_FILE, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+
+    print(f"✅ 已加载固定训练负样本: {TRAIN_NEGATIVES_FILE}")
+    print(f"   正负样本对数: {data['metadata']['total_pairs']}")
+
+    return data['negatives']
+
+
+def initialize_memory():
+    """初始化记忆（支持断点续训）"""
+    from config import CHECKPOINT_FILE
+
+    # ✅ 如果记忆已存在
+    if os.path.exists(os.path.join(MEMORY_BASE_DIR, "item")) or os.path.exists(os.path.join(MEMORY_BASE_DIR, "user")):
+        # ✅ 检查是否有断点文件
+        if os.path.exists(CHECKPOINT_FILE):
+            # 断点续训：保留现有memory
+            print(f"✅ 发现断点，使用现有记忆: {MEMORY_BASE_DIR}")
+            return
+        else:
+            # 没有断点但memory存在：用户需要选择
+            print(f"⚠️  记忆已存在: {MEMORY_BASE_DIR}")
+            print("检测到已有记忆但没有断点文件")
+            choice = input("1-继续使用现有记忆  2-删除重新开始 (1/2): ")
+            if choice == "2":
+                shutil.rmtree(MEMORY_BASE_DIR)
+                print(f"🗑️  已删除: {MEMORY_BASE_DIR}")
+            else:
+                print(f"✅ 使用现有记忆继续训练")
+                return
+
+    # ✅ 从头开始：复制初始记忆
+    print(f"🆕 正在创建新记忆目录: {MEMORY_BASE_DIR}")
+    os.makedirs(MEMORY_BASE_DIR, exist_ok=True)
+    shutil.copytree(f"{initial_memory_dir}/item", os.path.join(MEMORY_BASE_DIR, "item"))
+    shutil.copytree(f"{initial_memory_dir}/user", os.path.join(MEMORY_BASE_DIR, "user"))
+    shutil.copytree(f"{initial_memory_dir}/user-long", os.path.join(MEMORY_BASE_DIR, "user-long"))
+    print(f"✅ 记忆已初始化: {MEMORY_BASE_DIR}")
+
+
+def save_memory(ratio):
+    """保存当前记忆状态"""
+    src_folder = MEMORY_BASE_DIR
+    dst_folder = f"{MEMORY_BASE_DIR}_{ratio}"
+    try:
+        shutil.copytree(src_folder, dst_folder)
+        print(f"记忆已保存到: {dst_folder}")
+    except Exception as e:
+        print(f"保存记忆时出错: {e}")
+
+
+# ✅ 修改：支持固定负样本
+def get_neg_item_id(userId, pos_itemId, random_df, used_negatives=None, round_num=None, fixed_negatives=None):
+    """获取负样本ID"""
+    # 优先使用固定负样本
+    if fixed_negatives is not None and round_num is not None:
+        key = f"user_{userId}_pos_{pos_itemId}_round_{round_num}"
+        if key in fixed_negatives:
+            return fixed_negatives[key]
+        print(f"⚠️ 固定负样本中未找到 {key}，回退到随机选择")
+
+    # 回退到随机选择
+    user_id = int(userId)
+    pos_item = str(pos_itemId).strip()
+
+    user_row = random_df[random_df['user_id'] == user_id]
+    if len(user_row) == 0:
+        return None if used_negatives is not None else None
+
+    candidates = user_row['candidates'].values[0]
+    valid_candidates = [c for c in candidates if c != pos_item]
+
+    if used_negatives is not None:
+        valid_candidates = [c for c in valid_candidates if c not in used_negatives]
+
+    if len(valid_candidates) == 0:
+        valid_candidates = [c for c in candidates if c != pos_item]
+        if len(valid_candidates) == 0:
+            return None
+
+    return random.choice(valid_candidates)
+
+
+def create_round_based_batches(interDF):
+    """按轮次创建训练批次"""
+    batches = []
+    user_groups = interDF.groupby('user_id:token')
+    all_users = list(user_groups.groups.keys())
+
+    max_rounds = 5
+
+    print(f"📊 批次配置: 用户数={len(all_users)}, 轮次={max_rounds}, 批次大小={async_training_batch_size}")
+
+    for round_num in range(max_rounds):
+        user_batches = [all_users[i:i + async_training_batch_size] for i in
+                        range(0, len(all_users), async_training_batch_size)]
+
+        for batch_idx, user_batch in enumerate(user_batches):
+            batch = []
+            for user_id in user_batch:
+                if user_id in user_groups.groups:
+                    user_interactions = user_groups.get_group(user_id)
+                    if round_num < len(user_interactions):
+                        interaction = user_interactions.iloc[round_num]
+                    else:
+                        interaction_index = round_num % len(user_interactions)
+                        interaction = user_interactions.iloc[interaction_index]
+                    batch.append(interaction)
+
+            if batch:
+                batches.append(batch)
+
+    print(f"📦 总共创建 {len(batches)} 个批次")
+    return batches
+
+
+async def process_single_interaction_async(interaction, batch_idx, round_num, itemDF, random_df,
+                                           memory_lock, negative_samples_log, used_negatives, fixed_negatives):
+    """异步处理单个交互"""
+    try:
+        pos_itemId = str(interaction["item_id:token"]).strip()
+        userId = str(interaction["user_id:token"]).strip()
+
+        # ✅ 使用固定负样本
+        neg_itemId = get_neg_item_id(userId, pos_itemId, random_df, used_negatives, round_num, fixed_negatives)
+
+        if neg_itemId:
+            used_negatives.add(neg_itemId)
+
+        # ✅ 使用config中的路径
+        with memory_lock:
+            with open(f"{MEMORY_BASE_DIR}/user/user.{userId}", "r", encoding="utf-8") as file:
+                user_memory = file.read()
+            with open(f"{MEMORY_BASE_DIR}/item/item.{pos_itemId}", "r", encoding="utf-8") as file:
+                pos_item_memory = file.read()
+            with open(f"{MEMORY_BASE_DIR}/item/item.{neg_itemId}", "r", encoding="utf-8") as file:
+                neg_item_memory = file.read()
+
+        pos_item_row = itemDF[itemDF["item_id:token"] == pos_itemId]
+        pos_item_title = str(pos_item_row["title:token_seq"].values[0]) if len(
+            pos_item_row) > 0 else f"Item {pos_itemId}"
+
+        neg_item_row = itemDF[itemDF["item_id:token"] == neg_itemId]
+        neg_item_title = str(neg_item_row["title:token_seq"].values[0]) if len(
+            neg_item_row) > 0 else f"Item {neg_itemId}"
+
+        if save_negative_samples:
+            interaction_key = f"user_{userId}_pos_{pos_itemId}_round_{round_num}_batch_{batch_idx}"
+            negative_samples_log[interaction_key] = {
+                "user_id": userId,
+                "pos_item_id": pos_itemId,
+                "pos_item_title": pos_item_title,
+                "neg_item_id": neg_itemId,
+                "round_number": round_num,
+                "batch_index": batch_idx
+            }
+
+        user_description = user_memory
+        list_of_item_description = f"title:{neg_item_title.strip()}. description:{neg_item_memory.strip()}\ntitle:{pos_item_title}. description:{pos_item_memory.strip()}"
+        system_prompt = system_prompt_template(user_description, list_of_item_description)
+
+        responseText = await async_client.call_api_async(system_prompt, model)
+        if not responseText:
+            return
+
+        selected_item_title, system_reason = parse_response(responseText)
+
+        pos_similarity = fuzz.ratio(selected_item_title.lower(), pos_item_title.lower())
+        neg_similarity = fuzz.ratio(selected_item_title.lower(), neg_item_title.lower())
+        is_choice_right = pos_similarity > neg_similarity
+
+        # 新增------------------------------------------------------------------------------
+        attribute_analysis = None
+        if ENABLE_ATTRIBUTE_GUIDANCE:
+            # --- 关键修改点 ---
+            if is_choice_right:
+                attr_prompt = attribute_analysis_prompt_correct(
+                    user_description, pos_item_title, neg_item_title,
+                    pos_item_memory, neg_item_memory, system_reason
+                )
+            else:
+                attr_prompt = attribute_analysis_prompt_incorrect(
+                    user_description, pos_item_title, neg_item_title,
+                    pos_item_memory, neg_item_memory, system_reason
+                )
+
+            # 这里直接调用 API，不再通过 get_attribute_analysis 封装以减少改动
+            attr_res = await async_client.call_api_async(attr_prompt, model)
+            attribute_analysis = attr_res
+            # if not attribute_analysis or not attribute_analysis.strip():
+            #     print("Warning: LLM returned empty attribute analysis.")
+            # print("Attribute analysis: True")
+
+        # ========== 根据是否启用门控分两条独立路径 ==========
+        if ENABLE_MEMORY_GATING:
+            # ===== 路径A：有门控（考虑轮数） =====
+            # 用 create_prompts（分阶段策略prompt，按 round 使用 STM/LTM）
+            user_prompt, item_prompt = create_prompts(
+                user_description, list_of_item_description,
+                pos_item_title, neg_item_title,
+                system_reason, is_choice_right,
+                attribute_analysis, userId=userId, round_num=round_num
+            )
+
+            user_response = await async_client.call_api_async(user_prompt, model)
+
+            should_update = True
+            gate_score = None
+            stm_score = None
+            ltm_score = None
+
+            if user_response:
+                # 属性解析 + STM/History 保存
+                extracted_attrs = {}
+                if ENABLE_ATTRIBUTE_GUIDANCE:
+                    extracted_attrs = parse_attribute_rationale(user_response)
+                    save_stm_and_history(userId, extracted_attrs, round_num)
+
+                # UAMG 门控（Round 2+）
+                if ENABLE_ATTRIBUTE_GUIDANCE and round_num >= 2:
+                    gate_result = evaluate_memory_gate(
+                        userId, round_num, extracted_attrs, is_choice_right
+                    )
+                    gate_score = gate_result['gate_score']
+                    threshold = gate_result['threshold']
+                    stm_score = gate_result['stm_score']
+                    ltm_score = gate_result['ltm_score']
+                    should_update = gate_result['should_update']
+
+                    print(f"[Gate] User {userId} Round {round_num}: "
+                          f"Score={gate_score:.3f} "
+                          f"(LTM={ltm_score:.2f}, STM={stm_score:.2f}), "
+                          f"Threshold={threshold:.2f}")
+
+                # 根据门控结果决定更新方式
+                if should_update:
+                    update_user_memory(userId, user_response)
+                    print(f"✅ [Update] User {userId} memory updated (DIRECT)")
+                else:
+                    print(f"⚠️ [Adjust] User {userId} gate score below threshold, generating adjusted update...")
+                    adjusted_response = await generate_adjusted_memory_update(
+                        user_response, gate_score, stm_score, ltm_score, round_num, async_client, model
+                    )
+                    if adjusted_response:
+                        update_user_memory(userId, adjusted_response)
+                        print(f"✅ [Update] User {userId} memory updated (ADJUSTED)")
+                    else:
+                        print(f"⛔ [Error] User {userId} failed to generate adjusted update")
+
+            item_response = await async_client.call_api_async(item_prompt, model)
+            if item_response:
+                update_item_memory(pos_itemId, neg_itemId, item_response, update_neg=update_negative_samples)
+                print(f"✅ [Update] Items {pos_itemId}/{neg_itemId} updated")
+
+        else:
+            # ===== 路径B：无门控（仅属性引导，不考虑轮数，直接更新） =====
+            # 用 create_prompts1（基础属性prompt，不带 STM/LTM、不分阶段）
+            user_prompt, item_prompt = create_prompts1(
+                user_description, list_of_item_description,
+                pos_item_title, neg_item_title,
+                system_reason, is_choice_right,
+                attribute_analysis
+            )
+
+            user_response = await async_client.call_api_async(user_prompt, model)
+            if user_response:
+                update_user_memory(userId, user_response)
+                print(f"✅ [Update] User {userId} memory updated (NO-GATE)")
+            else:
+                print(f"⛔ [Error] User {userId} empty user_response, skip user memory update")
+
+            item_response = await async_client.call_api_async(item_prompt, model)
+            if item_response:
+                update_item_memory(pos_itemId, neg_itemId, item_response, update_neg=update_negative_samples)
+                print(f"✅ [Update] Items {pos_itemId}/{neg_itemId} updated (NO-GATE)")
+            else:
+                print(f"⛔ [Error] User {userId} empty item_response, skip item memory update")
+
+        print(f"✅ 用户 {userId} 第{round_num + 1}轮完成")
+
+    except Exception as e:
+        print(f"❌ 处理交互时出错: {e}")
+
+
+async def process_batch_async(batch, batch_idx, round_num, itemDF, random_df, memory_lock, negative_samples_log,
+                              fixed_negatives):
+    """异步处理单个训练批次"""
+    used_negatives = set()
+    tasks = []
+
+    for interaction in batch:
+        task = asyncio.create_task(
+            process_single_interaction_async(interaction, batch_idx, round_num, itemDF, random_df,
+                                             memory_lock, negative_samples_log, used_negatives, fixed_negatives)
+        )
+        tasks.append(task)
+
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def process_interaction(interDF, itemDF, random_df):
+    """处理训练交互（支持断点续训）"""
+    fixed_negatives = load_fixed_train_negatives()
+    negative_samples_log = {}
+    memory_lock = threading.Lock()
+    batches = create_round_based_batches(interDF)
+
+    # ✅ 智能断点检测
+    start_idx = 0
+    checkpoint = load_checkpoint()
+
+    if checkpoint:
+        progress = (checkpoint['batch'] + 1) / checkpoint['total'] * 100
+        print(f"\n{'=' * 60}")
+        print(f"📊 发现断点: 已完成 {checkpoint['batch'] + 1}/{checkpoint['total']} 批次 ({progress:.1f}%)")
+        print(f"{'=' * 60}")
+        choice = input("\n选择: 1-继续训练  2-从头开始 (1/2): ")
+
+        if choice == "1":
+            start_idx = checkpoint['batch'] + 1
+            print(f"🔄 从批次 {start_idx + 1} 继续训练...\n")
+        else:
+            clear_checkpoint()
+            print(f"🆕 从头开始训练...\n")
+
+    # ✅ 主训练循环（从start_idx开始）
+    try:
+        for i in range(start_idx, len(batches)):
+            batch = batches[i]
+            users_per_round = len(interDF.groupby('user_id:token'))
+            batches_per_round = (users_per_round + async_training_batch_size - 1) // async_training_batch_size
+            current_round = i // batches_per_round
+
+            # 处理批次
+            # asyncio.run(process_batch_async(batch, i % batches_per_round, current_round,
+            #                                itemDF, random_df, memory_lock, negative_samples_log, fixed_negatives))
+            await process_batch_async(batch, i % batches_per_round, current_round,
+                                      itemDF, random_df, memory_lock, negative_samples_log, fixed_negatives)
+
+            # ✅ 保存检查点（每个批次）
+            save_checkpoint(i, len(batches))
+
+            # 保存轮次记忆
+            if (i + 1) % batches_per_round == 0:
+                save_memory(f"round_{current_round + 1}")
+                print(f"✅ 第 {current_round + 1} 轮完成")
+
+    except KeyboardInterrupt:
+        print("\n⚠️  训练被用户中断")
+        print(f"💾 检查点已保存，下次可继续训练")
+        raise
+    except Exception as e:
+        print(f"\n❌ 训练出错: {e}")
+        print(f"💾 检查点已保存，可稍后继续")
+        raise
+
+    # ✅ 训练完成，清除检查点
+    clear_checkpoint()
+
+    # ========== 新增：门控统计分析 ==========创新点2
+    from config import ENABLE_MEMORY_GATING
+
+    if ENABLE_MEMORY_GATING and save_negative_samples:
+        # 收集门控统计
+        gate_stats = {
+            'total_updates': 0,
+            'accepted': 0,
+            'rejected': 0,
+            'avg_confidence_accepted': [],
+            'avg_confidence_rejected': [],
+            'rejection_by_stage': {'early': 0, 'mid': 0, 'late': 0}
+        }
+
+        for key, log in negative_samples_log.items():
+            if 'gate_log' in log:
+                gate = log['gate_log']
+                gate_stats['total_updates'] += 1
+
+                if gate['decision'] == 'ACCEPT':
+                    gate_stats['accepted'] += 1
+                    gate_stats['avg_confidence_accepted'].append(gate['confidence'])
+                else:
+                    gate_stats['rejected'] += 1
+                    gate_stats['avg_confidence_rejected'].append(gate['confidence'])
+
+                    # 统计拒绝发生在哪个阶段
+                    if gate['round'] < 20:
+                        gate_stats['rejection_by_stage']['early'] += 1
+                    elif gate['round'] < 50:
+                        gate_stats['rejection_by_stage']['mid'] += 1
+                    else:
+                        gate_stats['rejection_by_stage']['late'] += 1
+
+        # 计算接受率
+        if gate_stats['total_updates'] > 0:
+            acceptance_rate = gate_stats['accepted'] / gate_stats['total_updates']
+
+            print("\n" + "=" * 60)
+            print("门控统计 (UAMG - 创新点3)")
+            print("=" * 60)
+            print(f"总更新尝试: {gate_stats['total_updates']}")
+            print(f"接受: {gate_stats['accepted']} ({acceptance_rate * 100:.1f}%)")
+            print(f"拒绝: {gate_stats['rejected']} ({(1 - acceptance_rate) * 100:.1f}%)")
+
+            if gate_stats['avg_confidence_accepted']:
+                print(
+                    f"接受更新的平均置信度: {sum(gate_stats['avg_confidence_accepted']) / len(gate_stats['avg_confidence_accepted']):.2f}/10")
+            if gate_stats['avg_confidence_rejected']:
+                print(
+                    f"拒绝更新的平均置信度: {sum(gate_stats['avg_confidence_rejected']) / len(gate_stats['avg_confidence_rejected']):.2f}/10")
+
+            print(f"拒绝分布: 早期={gate_stats['rejection_by_stage']['early']}, "
+                  f"中期={gate_stats['rejection_by_stage']['mid']}, "
+                  f"后期={gate_stats['rejection_by_stage']['late']}")
+            print("=" * 60)
+
+            # 保存详细门控日志
+            gate_log_file = f"{LOG_DIR}/gate_logs_{exp_name}.json"
+            gate_logs = [log['gate_log'] for log in negative_samples_log.values() if 'gate_log' in log]
+            with open(gate_log_file, 'w', encoding='utf-8') as f:
+                json.dump({
+                    'statistics': gate_stats,
+                    'detailed_logs': gate_logs
+                }, f, indent=2, ensure_ascii=False)
+            print(f"门控日志已保存: {gate_log_file}")
+    # ========== 门控统计结束 ==========
+
+    print("\n🎉 训练完成！")
+
+    # 保存负样本日志
+    if save_negative_samples:
+        log_file = f"{LOG_DIR}/train_negative_samples_{exp_name}.json"
+        os.makedirs(LOG_DIR, exist_ok=True)
+        with open(log_file, "w", encoding="utf-8") as f:
+            json.dump(negative_samples_log, f, ensure_ascii=False, indent=2)
+        print(f"训练负样本日志已保存: {log_file}")
+
+
+def parse_response(responseText):
+    """解析LLM响应"""
+    selected_item_title = re.split(r"Choice:|\n", responseText)[1]
+    system_reason = re.split(r"Explanation:", responseText)[-1].strip()
+    return selected_item_title, system_reason
+
+
+# 新增------------------------------------------------------------------------------创新点1
+def create_prompts1(user_description, list_of_item_description, pos_item_title,
+                   neg_item_title, system_reason, is_choice_right,
+                   attribute_analysis=None):
+    """
+    创建更新提示
+    attribute_analysis: 如果启用属性监督，传入属性分析结果
+    """
+    if ENABLE_ATTRIBUTE_GUIDANCE and attribute_analysis:
+        # 使用属性增强版 prompt
+        if not is_choice_right:
+            user_prompt = user_prompt_system_role(user_description) + '\n' + \
+                          user_prompt_template_with_attr(list_of_item_description, pos_item_title,
+                                                   neg_item_title, system_reason, attribute_analysis)
+            item_prompt = item_prompt_template_with_attr(user_description, list_of_item_description,
+                                                   pos_item_title, neg_item_title,
+                                                   system_reason, attribute_analysis)
+        else:
+            user_prompt = user_prompt_system_role(user_description) + '\n' + \
+                          user_prompt_template_true_with_attr(list_of_item_description, pos_item_title,
+                                                        neg_item_title, system_reason, attribute_analysis)
+            item_prompt = item_prompt_template_true_with_attr(user_description, list_of_item_description,
+                                                        pos_item_title, neg_item_title, attribute_analysis)
+    else:
+        # 使用原版 prompt
+        if not is_choice_right:
+            user_prompt = user_prompt_system_role(user_description) + '\n' + \
+                          user_prompt_template(list_of_item_description, pos_item_title,
+                                               neg_item_title, system_reason)
+            item_prompt = item_prompt_template(user_description, list_of_item_description,
+                                               pos_item_title, neg_item_title, system_reason)
+        else:
+            user_prompt = user_prompt_system_role(user_description) + '\n' + \
+                          user_prompt_template_true(list_of_item_description, pos_item_title,
+                                                    neg_item_title, system_reason)
+            item_prompt = item_prompt_template_true(user_description, list_of_item_description,
+                                                    pos_item_title, neg_item_title)
+    return user_prompt, item_prompt
+# 新增------------------------------------------------------------------------------
+
+
+# 新增------------------------------------------------------------------------------创新点2
+def create_prompts(user_description, list_of_item_description, pos_item_title,
+                   neg_item_title, system_reason, is_choice_right,
+                   attribute_analysis=None, userId=None, round_num=0):
+    """
+    创建更新提示（分阶段策略）
+
+    参数:
+    - user_description: 用户当前记忆
+    - list_of_item_description: 物品描述列表
+    - pos_item_title: 正样本标题
+    - neg_item_title: 负样本标题
+    - system_reason: 系统推理
+    - is_choice_right: 是否选择正确
+    - attribute_analysis: 属性分析结果
+    - userId: 用户ID
+    - round_num: 当前轮次（0-based，0-4）
+
+    返回: (user_prompt, item_prompt)
+    """
+
+    current_memory = user_description
+    ltm_prompt = None
+    stm_summaries = None
+
+    # ========== Round 0-1: 使用基础prompt（创新点二上面的4个，不带LTM/STM） ==========
+    if round_num < 2:
+        if ENABLE_ATTRIBUTE_GUIDANCE and attribute_analysis:
+            # 使用带属性分析的prompt（不带LTM/STM）
+            if not is_choice_right:
+                user_prompt = user_prompt_system_role(current_memory) + '\n' + \
+                              user_prompt_template_with_attr(
+                                  list_of_item_description, pos_item_title,
+                                  neg_item_title, system_reason, attribute_analysis)
+                item_prompt = item_prompt_template_with_attr(
+                    current_memory, list_of_item_description,
+                    pos_item_title, neg_item_title, system_reason, attribute_analysis)
+            else:
+                user_prompt = user_prompt_system_role(current_memory) + '\n' + \
+                              user_prompt_template_true_with_attr(
+                                  list_of_item_description, pos_item_title,
+                                  neg_item_title, system_reason, attribute_analysis)
+                item_prompt = item_prompt_template_true_with_attr(
+                    current_memory, list_of_item_description,
+                    pos_item_title, neg_item_title, attribute_analysis)
+        else:
+            # 回退到基础版本（不带属性分析）
+            if not is_choice_right:
+                user_prompt = user_prompt_system_role(current_memory) + '\n' + \
+                              user_prompt_template(list_of_item_description, pos_item_title,
+                                                   neg_item_title, system_reason)
+                item_prompt = item_prompt_template(current_memory, list_of_item_description,
+                                                   pos_item_title, neg_item_title, system_reason)
+            else:
+                user_prompt = user_prompt_system_role(current_memory) + '\n' + \
+                              user_prompt_template_true(list_of_item_description, pos_item_title,
+                                                        neg_item_title, system_reason)
+                item_prompt = item_prompt_template_true(current_memory, list_of_item_description,
+                                                        pos_item_title, neg_item_title)
+
+    # ========== Round 2-3: 使用只带STM的prompt ==========
+    elif round_num < 4:
+        # 加载STM（Round 0到当前轮的前一轮）
+        stm_attributes = None
+        if userId:
+            stm_rounds = list(range(max(0, round_num - 2), round_num))  # 最近2轮
+            stm_attributes = load_stm_attributes(userId, stm_rounds)
+
+        if ENABLE_ATTRIBUTE_GUIDANCE and attribute_analysis:
+            # 使用带属性分析+STM的prompt
+            if not is_choice_right:
+                user_prompt = user_prompt_system_role(current_memory) + '\n' + \
+                              user_prompt_template_with_attr_stm(
+                                  list_of_item_description, pos_item_title,
+                                  neg_item_title, system_reason, attribute_analysis,
+                                  stm_attributes)
+                item_prompt = item_prompt_template_with_attr_stm(
+                    current_memory, list_of_item_description,
+                    pos_item_title, neg_item_title, system_reason, attribute_analysis,
+                    stm_attributes)
+            else:
+                user_prompt = user_prompt_system_role(current_memory) + '\n' + \
+                              user_prompt_template_true_with_attr_stm(
+                                  list_of_item_description, pos_item_title,
+                                  neg_item_title, system_reason, attribute_analysis,
+                                  stm_attributes)
+                item_prompt = item_prompt_template_true_with_attr_stm(
+                    current_memory, list_of_item_description,
+                    pos_item_title, neg_item_title, attribute_analysis,
+                    stm_attributes)
+        else:
+            # 回退到基础版本（不带属性分析，但这种情况不应该发生）
+            if not is_choice_right:
+                user_prompt = user_prompt_system_role(current_memory) + '\n' + \
+                              user_prompt_template(list_of_item_description, pos_item_title,
+                                                   neg_item_title, system_reason)
+                item_prompt = item_prompt_template(current_memory, list_of_item_description,
+                                                   pos_item_title, neg_item_title, system_reason)
+            else:
+                user_prompt = user_prompt_system_role(current_memory) + '\n' + \
+                              user_prompt_template_true(list_of_item_description, pos_item_title,
+                                                        neg_item_title, system_reason)
+                item_prompt = item_prompt_template_true(current_memory, list_of_item_description,
+                                                        pos_item_title, neg_item_title)
+
+    # ========== Round 4+: 使用带LTM+STM的prompt（创新点二下面的4个）==========
+    else:  # round_num >= 4
+        # 加载LTM（从History动态生成，返回属性字典）
+        ltm_attributes = None
+        if ENABLE_SEPARATE_LTM and userId:
+            ltm_attributes = generate_ltm_from_history(userId, min_occurrences=2)
+
+        # 加载STM（Round 2和Round 3的属性）
+        stm_attributes = None
+        if userId:
+            stm_attributes = load_stm_attributes(userId, [2, 3])
+
+        if ENABLE_ATTRIBUTE_GUIDANCE and attribute_analysis:
+            # 使用带属性分析+LTM+STM的prompt
+            if not is_choice_right:
+                user_prompt = user_prompt_system_role(current_memory) + '\n' + \
+                              user_prompt_template_with_attr_ltm(
+                                  list_of_item_description, pos_item_title,
+                                  neg_item_title, system_reason, attribute_analysis,
+                                  ltm_attributes, stm_attributes)
+                item_prompt = item_prompt_template_with_attr_ltm(
+                    current_memory, list_of_item_description,
+                    pos_item_title, neg_item_title, system_reason,
+                    attribute_analysis, ltm_attributes, stm_attributes)
+            else:
+                user_prompt = user_prompt_system_role(current_memory) + '\n' + \
+                              user_prompt_template_true_with_attr_ltm(
+                                  list_of_item_description, pos_item_title,
+                                  neg_item_title, system_reason, attribute_analysis,
+                                  ltm_attributes, stm_attributes)
+                item_prompt = item_prompt_template_true_with_attr_ltm(
+                    current_memory, list_of_item_description,
+                    pos_item_title, neg_item_title,
+                    attribute_analysis, ltm_attributes, stm_attributes)
+        else:
+            # 回退到基础版本（不带属性分析）
+            if not is_choice_right:
+                user_prompt = user_prompt_system_role(current_memory) + '\n' + \
+                              user_prompt_template(list_of_item_description, pos_item_title,
+                                                   neg_item_title, system_reason)
+                item_prompt = item_prompt_template(current_memory, list_of_item_description,
+                                                   pos_item_title, neg_item_title, system_reason)
+            else:
+                user_prompt = user_prompt_system_role(current_memory) + '\n' + \
+                              user_prompt_template_true(list_of_item_description, pos_item_title,
+                                                        neg_item_title, system_reason)
+                item_prompt = item_prompt_template_true(current_memory, list_of_item_description,
+                                                        pos_item_title, neg_item_title)
+
+    return user_prompt, item_prompt
+
+
+# 新增------------------------------------------------------------------------------
+
+
+def update_user_memory(userId, responseText):
+    """更新用户记忆"""
+    responseText = responseText.split("My updated self-introduction:")[-1].strip()
+
+    # ✅ 使用config中的路径
+    with open(f"{MEMORY_BASE_DIR}/user/user.{userId}", "w", encoding="utf-8") as file:
+        file.write(responseText)
+
+    with open(f"{MEMORY_BASE_DIR}/user-long/user.{userId}", "a", encoding="utf-8") as file:
+        file.write("\n=====\n")
+        file.write(responseText)
+
+
+async def generate_adjusted_memory_update(user_response, gate_score, stm_score, ltm_score, round_num, async_client, model):
+    """
+    生成调整后的记忆更新（只在gate_score < threshold时调用）
+
+    参数:
+        user_response: 用户本轮的原始自我介绍更新文本
+        gate_score: 门控分数（0-1，当前必然 < threshold）
+        round_num: 当前轮次
+        async_client: 异步API客户端
+        model: 模型名称
+
+    返回:
+        adjusted_memory: 调整后的记忆更新内容（完整response，包含"My updated self-introduction:"前缀）
+    """
+    from prompt import adjusted_memory_prompt
+
+    # 提取"My updated self-introduction:"后的内容
+    extracted_response = user_response.split("My updated self-introduction:")[-1].strip()
+
+    # 构建prompt
+    prompt = adjusted_memory_prompt(extracted_response, gate_score, stm_score, ltm_score, round_num)
+
+    # 调用LLM
+    response = await async_client.call_api_async(prompt, model)
+
+    # 返回完整的response（包含"My updated self-introduction:"前缀）
+    # 因为update_user_memory会自动提取
+    return response
+
+
+def update_item_memory(pos_itemId, neg_itemId, responseText, update_neg=True):
+    """更新物品记忆"""
+    updated_pos_item_intro = responseText.split("The updated description of the second item is: ")[-1]
+
+    # ✅ 使用config中的路径
+    with open(f"{MEMORY_BASE_DIR}/item/item.{pos_itemId}", "w", encoding="utf-8") as file:
+        file.write(updated_pos_item_intro)
+
+    if update_neg:
+        updated_neg_item_intro = \
+        re.split(r"The updated description of the first item is: |The updated description of the second item is: ",
+                 responseText)[1]
+        with open(f"{MEMORY_BASE_DIR}/item/item.{neg_itemId}", "w", encoding="utf-8") as file:
+            file.write(updated_neg_item_intro)
+
+
+if __name__ == "__main__":
+    print(f"开始训练 - {exp_name}")
+    print(f"属性引导: {'启用' if ENABLE_ATTRIBUTE_GUIDANCE else '关闭'}")
+    print(f"记忆门控: {'启用' if ENABLE_MEMORY_GATING else '关闭'}")
+    print(f"Prompt策略: {'create_prompts1（基础属性）' if ENABLE_MEMORY_GATING else 'create_prompts（分阶段）'}")
+    print(f"记忆目录: {MEMORY_BASE_DIR}")
+    print(f"日志目录: {LOG_DIR}")
+    print(f"使用固定负样本: {'是' if USE_FIXED_NEGATIVES else '否'}")
+    print(f"随机种子: {random_seed}")
+
+    random.seed(random_seed)
+
+    interDF = createInterDF(train_file)
+    itemDF = createItemDF(item_file)
+    random_df = createRandomDF(random_file)
+
+    print(f"训练数据: {len(interDF)} 条交互")
+
+    initialize_memory()
+    # process_interaction(interDF, itemDF, random_df)
+    asyncio.run(process_interaction(interDF, itemDF, random_df))
+
+    print("\n训练完成！")
+
+# def create_prompts(user_description, list_of_item_description, pos_item_title,
+#                    neg_item_title, system_reason, is_choice_right):
+#     """创建更新提示"""
+#     if not is_choice_right:
+#         user_prompt = user_prompt_system_role(user_description) + '\n' + \
+#                      user_prompt_template(list_of_item_description, pos_item_title,
+#                                         neg_item_title, system_reason)
+#         item_prompt = item_prompt_template(user_description, list_of_item_description,
+#                                           pos_item_title, neg_item_title, system_reason)
+#     else:
+#         user_prompt = user_prompt_system_role(user_description) + '\n' + \
+#                      user_prompt_template_true(list_of_item_description, pos_item_title,
+#                                               neg_item_title, system_reason)
+#         item_prompt = item_prompt_template_true(user_description, list_of_item_description,
+#                                                pos_item_title, neg_item_title)
+#     return user_prompt, item_prompt
+
+
+# async def process_single_interaction_async(interaction, batch_idx, round_num, itemDF, random_df,
+#                                          memory_lock, negative_samples_log, used_negatives, fixed_negatives):
+#     """异步处理单个交互"""
+#     try:
+#         pos_itemId = str(interaction["item_id:token"]).strip()
+#         userId = str(interaction["user_id:token"]).strip()
+#
+#         # ✅ 使用固定负样本
+#         neg_itemId = get_neg_item_id(userId, pos_itemId, random_df, used_negatives, round_num, fixed_negatives)
+#
+#         if neg_itemId:
+#             used_negatives.add(neg_itemId)
+#
+#         # ✅ 使用config中的路径
+#         with memory_lock:
+#             with open(f"{MEMORY_BASE_DIR}/user/user.{userId}", "r", encoding="utf-8") as file:
+#                 user_memory = file.read()
+#             with open(f"{MEMORY_BASE_DIR}/item/item.{pos_itemId}", "r", encoding="utf-8") as file:
+#                 pos_item_memory = file.read()
+#             with open(f"{MEMORY_BASE_DIR}/item/item.{neg_itemId}", "r", encoding="utf-8") as file:
+#                 neg_item_memory = file.read()
+#
+#         pos_item_row = itemDF[itemDF["item_id:token"] == pos_itemId]
+#         pos_item_title = str(pos_item_row["title:token_seq"].values[0]) if len(pos_item_row) > 0 else f"Item {pos_itemId}"
+#
+#         neg_item_row = itemDF[itemDF["item_id:token"] == neg_itemId]
+#         neg_item_title = str(neg_item_row["title:token_seq"].values[0]) if len(neg_item_row) > 0 else f"Item {neg_itemId}"
+#
+#         if save_negative_samples:
+#             interaction_key = f"user_{userId}_pos_{pos_itemId}_round_{round_num}_batch_{batch_idx}"
+#             negative_samples_log[interaction_key] = {
+#                 "user_id": userId,
+#                 "pos_item_id": pos_itemId,
+#                 "pos_item_title": pos_item_title,
+#                 "neg_item_id": neg_itemId,
+#                 "round_number": round_num,
+#                 "batch_index": batch_idx
+#             }
+#
+#         user_description = user_memory
+#         list_of_item_description = f"title:{neg_item_title.strip()}. description:{neg_item_memory.strip()}\ntitle:{pos_item_title}. description:{pos_item_memory.strip()}"
+#         system_prompt = system_prompt_template(user_description, list_of_item_description)
+#
+#         responseText = await async_client.call_api_async(system_prompt, model)
+#         if not responseText:
+#             return
+#
+#         selected_item_title, system_reason = parse_response(responseText)
+#
+#         pos_similarity = fuzz.ratio(selected_item_title.lower(), pos_item_title.lower())
+#         neg_similarity = fuzz.ratio(selected_item_title.lower(), neg_item_title.lower())
+#         is_choice_right = pos_similarity > neg_similarity
+#
+#
+#         user_prompt, item_prompt = create_prompts(user_description, list_of_item_description,
+#                                                  pos_item_title, neg_item_title,
+#                                                  system_reason, is_choice_right)
+#
+#         user_response = await async_client.call_api_async(user_prompt, model)
+#         if user_response:
+#             update_user_memory(userId, user_response)
+#
+#         item_response = await async_client.call_api_async(item_prompt, model)
+#         if item_response:
+#             update_item_memory(pos_itemId, neg_itemId, item_response, update_neg=update_negative_samples)
+#
+#         print(f"✅ 用户 {userId} 第{round_num+1}轮完成")
+#
+#     except Exception as e:
+#         print(f"❌ 处理交互时出错: {e}")
