@@ -169,7 +169,7 @@ elif _exp_suffix and 'memory_dir' in eval_config:
 
 # ============= 模型配置 =============
 candidate_num = 10
-model = "glm-4.5"
+model = "gpt-4o"
 evaluation_times = 1
 
 # ============= 训练配置 =============
