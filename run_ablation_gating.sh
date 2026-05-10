@@ -111,14 +111,19 @@ for DATASET in "${DATASETS[@]}"; do
     EXP2_START=$(date +%s)
 
     echo ""
-    echo ">>> [$DATASET] 实验2 - 步骤 1/2: 训练"
+    echo ">>> [$DATASET] 实验2 - 步骤 1/3: 训练"
     echo "--------------------------------------------------------------------------------"
     $PYTHON_CMD AgentCF_train_check.py
 
     echo ""
-    echo ">>> [$DATASET] 实验2 - 步骤 2/2: 测试"
+    echo ">>> [$DATASET] 实验2 - 步骤 2/3: 测试 (EVAL_MODE=rrf)"
     echo "--------------------------------------------------------------------------------"
-    $PYTHON_CMD AgentCF_Test_log-.py
+    EVAL_MODE=rrf $PYTHON_CMD AgentCF_Test_log-.py
+
+    echo ""
+    echo ">>> [$DATASET] 实验2 - 步骤 3/3: 测试 (EVAL_MODE=description)"
+    echo "--------------------------------------------------------------------------------"
+    EVAL_MODE=description $PYTHON_CMD AgentCF_Test_log-.py
 
     EXP2_END=$(date +%s)
     DS_EXP2_TIME[$DATASET]=$((EXP2_END - EXP2_START))
