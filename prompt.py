@@ -949,95 +949,95 @@ The updated description of the second item is: [Updated description for '{pos_it
 # My updated self-introduction: [Your adjusted version here, in the same style as the original]
 # """
 
+# def adjusted_memory_prompt(extracted_response, gate_score, stm_score, ltm_score, round_num):
+#     """
+#     生成带有属性重叠与极性分析思考的 Prompt
+# 
+#     参数逻辑：
+#     - stm_score: 基于当前轮与前两轮的属性重叠及极性分析
+#     - ltm_score: 基于当前轮与历史所有轮次的对比
+#     """
+# 
+#     # 动态生成思考逻辑引导
+#     if ltm_score == 0:
+#         # 此时主要看近期三轮的局部波动
+#         thought_guidance = (
+#             "1. **Short-term Fluctuation**: Analyze why the attribute overlap or sentiment polarity "
+#             f"has shifted across the last 3 rounds (STM Score: {stm_score:.2f})."
+#         )
+#     else:
+#         # 此时需要对比局部波动与全局长期的差异
+#         thought_guidance = (
+#             f"1. **Short-term Consistency**: Evaluate the attribute/polarity overlap within the 3-round sliding window (STM Score: {stm_score:.2f}).\n"
+#             f"2. **Long-term Deviation**: Analyze how current preferences diverge from the historical global baseline (LTM Score: {ltm_score:.2f})."
+#         )
+# 
+#     return f"""You are a specialized agent for maintaining user preference profiles in a recommendation system.
+# 
+# **Context Metrics**:
+# - **Current Round**: {round_num}
+# - **Gate Score**: {gate_score:.2f} (Stability indicator)
+# - **Short-term Memory (STM) Score**: {stm_score:.2f} (Overlap/Polarity check of the last 3 rounds)
+# - **Long-term Memory (LTM) Score**: {ltm_score:.2f} (Correlation with all historical rounds)
+# 
+# **User's Original Self-Introduction Update**:
+# {extracted_response}
+# 
+# **Task**:
+# The low stability score indicates a potential "preference drift" or "exploratory behavior."
+# You must output the original update followed by a deep reflection on why the memory is currently unstable.
+# 
+# **Reflection Requirements**:
+# {thought_guidance}
+# 3. Distinguish between a "genuine interest shift" and "random noise" based on the scores provided.
+# 
+# **Output Format**:
+# My updated self-introduction:
+# {extracted_response}
+# 
+# [Reflective Thoughts]:
+# (Provide a concise analysis focusing on attribute overlap and sentiment polarity changes compared to short-term and long-term history)
+# """
+
 def adjusted_memory_prompt(extracted_response, gate_score, stm_score, ltm_score, round_num):
     """
-    生成带有属性重叠与极性分析思考的 Prompt
-
-    参数逻辑：
-    - stm_score: 基于当前轮与前两轮的属性重叠及极性分析
-    - ltm_score: 基于当前轮与历史所有轮次的对比
+    生成带有属性重叠与极性分析思考的 Prompt，并严格限制反思长度。
     """
 
     # 动态生成思考逻辑引导
     if ltm_score == 0:
-        # 此时主要看近期三轮的局部波动
         thought_guidance = (
-            "1. **Short-term Fluctuation**: Analyze why the attribute overlap or sentiment polarity "
-            f"has shifted across the last 3 rounds (STM Score: {stm_score:.2f})."
+            f"1. **Short-term Fluctuation**: Briefly explain the shift in attribute overlap/polarity "
+            f"across the last 3 rounds (STM Score: {stm_score:.2f})."
         )
     else:
-        # 此时需要对比局部波动与全局长期的差异
         thought_guidance = (
-            f"1. **Short-term Consistency**: Evaluate the attribute/polarity overlap within the 3-round sliding window (STM Score: {stm_score:.2f}).\n"
-            f"2. **Long-term Deviation**: Analyze how current preferences diverge from the historical global baseline (LTM Score: {ltm_score:.2f})."
+            f"1. **Consistency vs. Deviation**: Compare the 3-round window stability (STM: {stm_score:.2f}) "
+            f"against the historical baseline (LTM: {ltm_score:.2f})."
         )
 
-    return f"""You are a specialized agent for maintaining user preference profiles in a recommendation system.
+    return f"""You are a specialized agent for maintaining user preference profiles.
 
 **Context Metrics**:
 - **Current Round**: {round_num}
 - **Gate Score**: {gate_score:.2f} (Stability indicator)
-- **Short-term Memory (STM) Score**: {stm_score:.2f} (Overlap/Polarity check of the last 3 rounds)
-- **Long-term Memory (LTM) Score**: {ltm_score:.2f} (Correlation with all historical rounds)
+- **Short-term (STM)**: {stm_score:.2f} | **Long-term (LTM)**: {ltm_score:.2f}
 
-**User's Original Self-Introduction Update**:
+**User's Original Update**:
 {extracted_response}
 
 **Task**:
-The low stability score indicates a potential "preference drift" or "exploratory behavior."
-You must output the original update followed by a deep reflection on why the memory is currently unstable.
+Analyze the "preference drift" indicated by the scores. Output the original update followed by a **highly concise** reflection.
 
-**Reflection Requirements**:
+**Reflection Constraints**:
 {thought_guidance}
-3. Distinguish between a "genuine interest shift" and "random noise" based on the scores provided.
+2. Distinguish "genuine shift" vs. "noise".
+3. **LENGTH LIMIT**: Your reflection MUST be shorter than the user's original update provided above. Keep it under 2-3 sentences max.
 
 **Output Format**:
 My updated self-introduction:
 {extracted_response}
 
 [Reflective Thoughts]:
-(Provide a concise analysis focusing on attribute overlap and sentiment polarity changes compared to short-term and long-term history)
+(Concise analysis of attribute/polarity overlap. Must be shorter than the introduction above.)
 """
-
-# def adjusted_memory_prompt(extracted_response, gate_score, stm_score, ltm_score, round_num):
-#     """
-#     生成带有属性重叠与极性分析思考的 Prompt，并严格限制反思长度。
-#     """
-#
-#     # 动态生成思考逻辑引导
-#     if ltm_score == 0:
-#         thought_guidance = (
-#             f"1. **Short-term Fluctuation**: Briefly explain the shift in attribute overlap/polarity "
-#             f"across the last 3 rounds (STM Score: {stm_score:.2f})."
-#         )
-#     else:
-#         thought_guidance = (
-#             f"1. **Consistency vs. Deviation**: Compare the 3-round window stability (STM: {stm_score:.2f}) "
-#             f"against the historical baseline (LTM: {ltm_score:.2f})."
-#         )
-#
-#     return f"""You are a specialized agent for maintaining user preference profiles.
-#
-# **Context Metrics**:
-# - **Current Round**: {round_num}
-# - **Gate Score**: {gate_score:.2f} (Stability indicator)
-# - **Short-term (STM)**: {stm_score:.2f} | **Long-term (LTM)**: {ltm_score:.2f}
-#
-# **User's Original Update**:
-# {extracted_response}
-#
-# **Task**:
-# Analyze the "preference drift" indicated by the scores. Output the original update followed by a **highly concise** reflection.
-#
-# **Reflection Constraints**:
-# {thought_guidance}
-# 2. Distinguish "genuine shift" vs. "noise".
-# 3. **LENGTH LIMIT**: Your reflection MUST be shorter than the user's original update provided above. Keep it under 2-3 sentences max.
-#
-# **Output Format**:
-# My updated self-introduction:
-# {extracted_response}
-#
-# [Reflective Thoughts]:
-# (Concise analysis of attribute/polarity overlap. Must be shorter than the introduction above.)
-# """
