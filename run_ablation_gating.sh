@@ -30,7 +30,7 @@ fi
 
 echo "Using Python: $PYTHON_CMD"
 
-DATASETS=("All_Beauty" "Cell_Phones" "Fashion")
+DATASETS=("CDs" "All_Beauty" "Cell_Phones" "Fashion")
 
 echo "================================================================================"
 echo "消融实验：门控机制对比"
